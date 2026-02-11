@@ -1,17 +1,22 @@
 import streamlit as st
 import pandas as pd
+from io import BytesIO
 
 # =====================================================
 # PAGE CONFIG
 # =====================================================
 st.set_page_config(page_title="Full Time BT Monitor", layout="wide")
 st.title("Full Time BT Monitor")
-st.caption("Shows monthly hours by BT. PASS = >130 hours in all 3 selected months (Completed=Yes only).")
+st.caption("PASS = >130 hours in all 3 selected months (Completed=Yes + Direct Service BT only)")
 
 # =====================================================
 # UPLOAD
 # =====================================================
-uploaded_file = st.file_uploader("Upload Aloha Appointment Billing File", type=["csv", "xlsx"])
+uploaded_file = st.file_uploader(
+    "Upload Aloha Appointment Billing File",
+    type=["csv", "xlsx"]
+)
+
 if not uploaded_file:
     st.stop()
 
@@ -28,11 +33,13 @@ else:
 # =====================================================
 COL_STAFF = "Staff Name"
 COL_DATE = "Appt. Date"
-COL_HOURS = "Billing Hours"
+COL_UNITS = "Units"
 COL_COMPLETED = "Completed"
+COL_SERVICE = "Service Name"
 
-required_cols = [COL_STAFF, COL_DATE, COL_HOURS, COL_COMPLETED]
+required_cols = [COL_STAFF, COL_DATE, COL_UNITS, COL_COMPLETED, COL_SERVICE]
 missing = [c for c in required_cols if c not in df.columns]
+
 if missing:
     st.error(f"Missing required columns: {missing}")
     st.stop()
@@ -44,31 +51,39 @@ df[COL_COMPLETED] = df[COL_COMPLETED].astype(str).str.strip().str.lower()
 df = df[df[COL_COMPLETED] == "yes"].copy()
 
 # =====================================================
+# FILTER: Service Name = Direct Service BT
+# =====================================================
+df[COL_SERVICE] = df[COL_SERVICE].astype(str).str.strip()
+df = df[df[COL_SERVICE] == "Direct Service BT"].copy()
+
+# =====================================================
 # NORMALIZE
 # =====================================================
 df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce")
 df = df.dropna(subset=[COL_DATE]).copy()
 
-df[COL_HOURS] = pd.to_numeric(df[COL_HOURS], errors="coerce").fillna(0)
+df[COL_UNITS] = pd.to_numeric(df[COL_UNITS], errors="coerce").fillna(0)
 
-# Build YearMonth like 2025-10
+# Convert Units → Hours (15 min units)
+df["Hours"] = df[COL_UNITS] / 4
+
 df["YearMonth"] = df[COL_DATE].dt.to_period("M").astype(str)
 
 # =====================================================
 # MONTHLY TOTALS
 # =====================================================
 monthly_hours = (
-    df.groupby([COL_STAFF, "YearMonth"], as_index=False)[COL_HOURS]
+    df.groupby([COL_STAFF, "YearMonth"], as_index=False)["Hours"]
       .sum()
-      .rename(columns={COL_HOURS: "Monthly Hours"})
 )
 
 # =====================================================
-# MONTH SELECTOR (3 months)
+# MONTH SELECTOR
 # =====================================================
 all_months = sorted(monthly_hours["YearMonth"].unique())
 
 default_months = all_months[-3:] if len(all_months) >= 3 else all_months
+
 selected_months = st.multiselect(
     "Select exactly 3 months to evaluate full-time status",
     options=all_months,
@@ -79,34 +94,32 @@ if len(selected_months) != 3:
     st.warning("Please select exactly 3 months.")
     st.stop()
 
-selected_months = sorted(selected_months)  # ensure order like 2025-10, 2025-11, 2025-12
+selected_months = sorted(selected_months)
 
 # =====================================================
-# PIVOT: headers are the months, values are hours
+# PIVOT TABLE (Month headers with actual hours)
 # =====================================================
 pivot = (
     monthly_hours[monthly_hours["YearMonth"].isin(selected_months)]
     .pivot_table(
         index=COL_STAFF,
         columns="YearMonth",
-        values="Monthly Hours",
+        values="Hours",
         aggfunc="sum",
         fill_value=0
     )
     .reset_index()
 )
 
-# Ensure the selected months exist as columns (even if missing for some staff)
+# Ensure selected months exist
 for m in selected_months:
     if m not in pivot.columns:
         pivot[m] = 0
 
-# Reorder columns: Staff Name + the 3 month headers
 pivot = pivot[[COL_STAFF] + selected_months]
 
 # =====================================================
 # PASS / NO PASS
-# PASS = >130 in ALL 3 selected months
 # =====================================================
 pass_mask = (pivot[selected_months] > 130).all(axis=1)
 
@@ -121,17 +134,25 @@ no_pass_df["Status"] = "NO PASS"
 # =====================================================
 st.subheader("✅ PASS (Full-Time BTs)")
 if pass_df.empty:
-    st.info("No BTs met the full-time requirement for the selected 3 months.")
+    st.info("No BTs met full-time requirement.")
 else:
     st.dataframe(pass_df, use_container_width=True)
 
 # =====================================================
-# DOWNLOAD (PASS ONLY)
+# EXCEL DOWNLOAD (Two Sheets)
 # =====================================================
-csv = pass_df.to_csv(index=False).encode("utf-8")
+def create_excel(pass_df, no_pass_df):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pass_df.to_excel(writer, sheet_name="PASS", index=False)
+        no_pass_df.to_excel(writer, sheet_name="NO PASS", index=False)
+    return output.getvalue()
+
+excel_data = create_excel(pass_df, no_pass_df)
+
 st.download_button(
     label="⬇️ Download Full-Time BT",
-    data=csv,
-    file_name="Full_Time_BT_List.csv",
-    mime="text/csv"
+    data=excel_data,
+    file_name="Full_Time_BT_List.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
